@@ -1,0 +1,252 @@
+package kk.imageviewer;
+
+import org.imgscalr.Scalr;
+
+import javax.imageio.ImageIO;
+import java.awt.*;
+import java.awt.image.BufferedImage;
+import java.io.File;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.concurrent.BlockingDeque;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.LinkedBlockingDeque;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.logging.Logger;
+
+public class ImageCache {
+
+    private static final int STATUS_DONE = 2;
+    private static final int STATUS_WAIT = 0;
+    private static final int STATUS_WORK = 1;
+
+    private static final Logger LOG = Logger.getLogger("ImageCache");
+    public static final int NUMBER_OF_THREADS = 4;
+
+    private final DirHandler dir;
+    private final Map<Integer, ImageProcessing> cache = new HashMap<>();
+    private final BlockingDeque<Integer> workQueue = new LinkedBlockingDeque<>(10);
+    private final ImageReaderThread[] threads = new ImageReaderThread[NUMBER_OF_THREADS];
+    private final Object updateLock = new Object();
+    private final AtomicInteger lastRequest = new AtomicInteger(0);
+
+    public ImageCache(DirHandler dir, int fileCacheSize, int th) {
+        this.dir = dir;
+        for (int i = 0; i < 4; i++) {
+            threads[i] = new ImageReaderThread(i);
+            new Thread(threads[i]).start();
+        }
+
+        new Thread(new CleanerThread()).start();
+    }
+
+    public ImageFutureHandle loadImage(int idx, int frameWidth, int frameHeight) {
+        String name = dir.getFile(idx).getName();
+        Size size = new Size(frameWidth, frameHeight);
+        lastRequest.set(idx);
+        ArrayList<Integer> scheduled = new ArrayList<>(15);
+        ImageFutureHandle res;
+        synchronized (updateLock) {
+            for (int i = idx - 5; i <= idx + 5; i++) {
+                if (schedule(i, size))
+                    scheduled.add(i);
+            }
+            ImageProcessing imageProcessing = cache.get(idx);
+            if (imageProcessing != null) {
+                if (imageProcessing.status == STATUS_DONE) {
+                    res = new ImageFutureHandle(idx, name,
+                            CompletableFuture.completedFuture(new ImageResult(idx, imageProcessing.fileName, imageProcessing.img)));
+                } else {
+                    CompletableFuture<ImageResult> future = new CompletableFuture<>();
+                    if (imageProcessing.future != null)
+                        imageProcessing.future.cancel(true);
+                    imageProcessing.future = future;
+
+                    res = new ImageFutureHandle(idx, name, future);
+                }
+            } else {
+                throw new IllegalStateException("no mapping in cache");
+            }
+        }
+        for (Integer i : scheduled) {
+            try {
+                workQueue.putFirst(i);
+            } catch (InterruptedException e) {
+                throw new RuntimeException(e);
+            }
+        }
+
+        return res;
+    }
+
+    private boolean schedule(int idx, Size size) {
+        if (idx < 0 || idx >= dir.getN())
+            return false;
+        String name = dir.getFile(idx).getName();
+        ImageProcessing imageProcessing = cache.get(idx);
+        if (imageProcessing != null) {
+            if (imageProcessing.fileName.equals(name) && imageProcessing.outputSize.equals(size))
+                return false;
+            System.out.println("wrong filename or frame size at idx " + idx + " | " + imageProcessing);
+        }
+        cache.put(idx, new ImageProcessing(name, size));
+        return true;
+    }
+
+    public void delete(int idx) {
+        synchronized (updateLock) {
+            Iterator<Map.Entry<Integer, ImageProcessing>> it = cache.entrySet().iterator();
+            while (it.hasNext()) {
+                Map.Entry<Integer, ImageProcessing> next = it.next();
+                if (next.getKey() >= idx) {
+                    CompletableFuture<ImageResult> future = next.getValue().future;
+                    if (future != null)
+                        future.cancel(true);
+                }
+                it.remove();
+            }
+            dir.delete(idx);
+        }
+    }
+
+    public record ImageResult(int indexInDir, String fileName, BufferedImage image) {
+    }
+
+
+    public record ImageFutureHandle(int idx, String fileName, CompletableFuture<ImageResult> future) {
+    }
+
+    private static class ImageProcessing {
+        final String fileName;
+        final Size outputSize;
+        BufferedImage img = null;
+        CompletableFuture<ImageResult> future = null;
+        int status = 0;
+
+        public ImageProcessing(String fileName, Size outputSize) {
+            this.fileName = fileName;
+            this.outputSize = outputSize;
+        }
+
+        @Override
+        public String toString() {
+            return "ImageProcessing{" +
+                    "fileName='" + fileName + '\'' +
+                    ", outputSize=" + outputSize +
+                    ", status=" + status +
+                    '}';
+        }
+    }
+
+    private class ImageReaderThread implements Runnable {
+        final int id;
+        final Logger log;
+        private final String name;
+
+        ImageReaderThread(int id) {
+            this.id = id;
+            this.name = "ImageReaderThread-" + id;
+            log = Logger.getLogger(name);
+        }
+
+        @Override
+        public void run() {
+            Thread.currentThread().setName(name);
+            while (true) {
+                try {
+                    int idx = workQueue.take();
+                    ImageProcessing imageProcessing;
+                    synchronized (updateLock) {
+
+                        imageProcessing = cache.get(idx);
+
+                        if (imageProcessing == null) {
+                            log.info("image request is null");
+                            continue;
+                        }
+
+                        if (Math.abs(lastRequest.get() - idx) > 10) {
+                            log.info("image request is too old, request idx is" + idx + ", last requested is " + lastRequest.get());
+                            if (imageProcessing.future != null)
+                                imageProcessing.future.cancel(true);
+                            cache.remove(idx);
+                            continue;
+                        }
+
+                        if (imageProcessing.status != STATUS_WAIT) {
+                            log.info("request is already being handled");
+                            continue;
+                        }
+                        imageProcessing.status = STATUS_WORK;
+                    }
+                    long loadingStart = System.currentTimeMillis();
+                    File file = dir.getFile(idx);
+                    log.info("starting loading " + idx + " (" + file.getName() + ")");
+                    BufferedImage img = ImageIO.read(file);
+                    Size targetImageSize = fitImageIntoFrame(new Size(img.getWidth(), img.getHeight()), imageProcessing.outputSize);
+                    img = Scalr.scaleImageIncrementally(img, targetImageSize.width, targetImageSize.height, Scalr.Method.QUALITY, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+
+                    synchronized (updateLock) {
+                        imageProcessing.status = STATUS_DONE;
+                        imageProcessing.img = img;
+                        CompletableFuture<ImageResult> future = imageProcessing.future;
+                        if (future != null) {
+                            future.complete(new ImageResult(idx, imageProcessing.fileName, img));
+                        }
+                        imageProcessing.future = null;
+
+                        log.info("loading done " + idx + " in " + (System.currentTimeMillis() - loadingStart) + "ms");
+                    }
+                } catch (IOException | InterruptedException e) {
+                    e.printStackTrace();
+                }
+
+            }
+        }
+    }
+
+    private record Size (int width, int height) {
+    }
+
+    private Size fitImageIntoFrame(Size img, Size frame) {
+        var sw = img.width;
+        var sh = img.height;
+
+        double sratio = (double) sw / sh;
+
+        var tw = frame.width;
+        var th = frame.height;
+
+        double tratio = (double) tw / th;
+
+        int rw, rh;
+        if (sratio > tratio) {
+            rw = tw;
+            rh = (int) (tw / sratio);
+        } else {
+            rh = th;
+            rw = (int) (th * sratio);
+        }
+
+        return new Size(rw, rh);
+    }
+
+    private class CleanerThread implements Runnable {
+        @Override
+        public void run() {
+            while (true) {
+                try {
+                    Thread.sleep(4);
+                } catch (InterruptedException e) {
+                    throw new RuntimeException(e);
+                }
+                synchronized (updateLock) {
+                    cache.keySet().removeIf(idx -> Math.abs(idx - lastRequest.get()) > 15);
+                }
+            }
+        }
+    }
+}
