@@ -1,72 +1,46 @@
 package kk.imageviewer;
 
 
-import javax.imageio.ImageIO;
 import javax.swing.*;
 import java.awt.*;
 import java.awt.event.*;
 import java.awt.image.BufferedImage;
-import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
-import java.util.HashMap;
-import java.util.Map;
+import java.nio.file.Path;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.LogManager;
 
 public class Viewer extends JFrame {
 
-    private final DirHandler dirHandler;
-    private final ImageCache cache;
+    private final ImageManager imageManager;
+    private final AtomicReference<Integer> lastImageIdx = new AtomicReference<>(-1);
+    private final AtomicReference<BufferedImage> imgRef = new AtomicReference<>();
+    private int currentIdx = 0;
+    private ImageManager.ImageFutureHandle currentResult;
 
-    private final Map<File, BufferedImage> imageCache = new HashMap<>();
-    private final Map<File, BufferedImage> renderedCache = new HashMap<>();
-    AtomicReference<BufferedImage> imgRef = new AtomicReference<>();
     private final JPanel imagePanel = new JPanel(true) {
-        {
-            setBackground(Color.BLACK);
-            addComponentListener(new ComponentAdapter() {
-                @Override
-                public void componentResized(ComponentEvent e) {
-
-                }
-            });
-        }
-
-
         @Override
         protected void paintComponent(Graphics g) {
             super.paintComponent(g);
-            BufferedImage img = imgRef.get();
+            var img = imgRef.get();
             if (img == null)
                 return;
 
-            var sw = img.getWidth();
-            var sh = img.getHeight();
-            var tw = getWidth();
-            var th = getHeight();
-
-            g.drawImage(img, (tw - sw) / 2, (th - sh) / 2, null);
-        }
-
-        @Override
-        protected void paintChildren(Graphics g) {
+            g.drawImage(img, (getWidth() - img.getWidth()) / 2, (getHeight() - img.getHeight()) / 2, null);
         }
     };
-    AtomicReference<Integer> lastImageIdx = new AtomicReference<>(-1);
-    private int currentIdx = 0;
-    private ImageCache.ImageFutureHandle currentResult;
 
-    public Viewer(String dirPath) throws HeadlessException {
+    public Viewer(Path directory) throws HeadlessException, IOException {
         super("ImageViewer");
         this.setDefaultCloseOperation(EXIT_ON_CLOSE);
         this.setSize(1000, 800);
         this.add(imagePanel);
-        setBackground(Color.BLACK);
-        this.dirHandler = new DirHandler(new File(dirPath));
-        this.cache = new ImageCache(dirHandler, 0, 4);
+        this.imagePanel.setBackground(Color.BLACK);
+        this.setBackground(Color.BLACK);
+        this.imageManager = new ImageManager(directory, 0, 4);
         this.currentIdx = 0;
         setupListeners();
     }
@@ -74,7 +48,7 @@ public class Viewer extends JFrame {
     public static void main(String[] args) throws UnsupportedLookAndFeelException, ClassNotFoundException, InstantiationException, IllegalAccessException, IOException {
         LogManager.getLogManager().readConfiguration(new FileInputStream("logging.properties"));
         UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
-        new Viewer("/media/sshfs0/photo/").setVisible(true);
+        new Viewer(Path.of("/media/sshfs0/photo/")).setVisible(true);
     }
 
     private boolean isCurrentLoadingInProgress() {
@@ -91,16 +65,16 @@ public class Viewer extends JFrame {
         });
 
         this.addComponentListener(new ComponentAdapter() {
-            private Timer recalculateTimer = new Timer(150, (ignored) -> reload());
+            private final Timer reloadTimer = new Timer(150, (ignored) -> reload());
 
             {
-                recalculateTimer.setRepeats(false);
+                reloadTimer.setRepeats(false);
             }
 
             @Override
             public void componentResized(ComponentEvent e) {
-                recalculateTimer.restart();
-                recalculateTimer.start();
+                reloadTimer.restart();
+                reloadTimer.start();
             }
         });
 
@@ -121,26 +95,22 @@ public class Viewer extends JFrame {
             public void keyPressed(KeyEvent e) {
                 if (isCurrentLoadingInProgress())
                     return;
-                if (e.getKeyCode() == KeyEvent.VK_DOWN) {
-                    loadNext();
-                } else if (e.getKeyCode() == KeyEvent.VK_UP) {
-                    loadPrev();
-                } else if (e.getKeyCode() == KeyEvent.VK_DELETE) {
-                    if (e.isShiftDown()) {
-                        if (System.currentTimeMillis() - e.getWhen() < 100) {
-                            if (currentIdx != lastImageIdx.get()) {
-                                System.out.println("index doesn't match!");
-                            } else {
-                                System.out.println("deleting " + lastImageIdx);
-                                cache.delete(currentResult.idx());
-                                load(currentIdx);
-                            }
+                switch (e.getKeyCode()) {
+                    case KeyEvent.VK_DOWN -> loadNext();
+                    case KeyEvent.VK_UP -> loadPrev();
+                    case KeyEvent.VK_DELETE -> {
+                        if (!e.isShiftDown() || System.currentTimeMillis() - e.getWhen() > 100)
+                            break;
+                        if (currentIdx != lastImageIdx.get()) {
+                            System.out.println("index doesn't match!");
+                        } else {
+                            System.out.println("deleting " + lastImageIdx);
+                            imageManager.delete(currentResult.idx());
+                            load(currentIdx);
                         }
                     }
                 }
             }
-
-
         });
     }
 
@@ -151,9 +121,10 @@ public class Viewer extends JFrame {
     private void load(int idx) {
         if (this.currentResult != null)
             currentResult.future().cancel(false);
-        ImageCache.ImageFutureHandle result = cache.loadImage(idx, imagePanel.getWidth(), imagePanel.getHeight());
+        ImageManager.ImageFutureHandle result = imageManager.loadImage(idx, imagePanel.getWidth(), imagePanel.getHeight());
         currentResult = result;
         this.setTitle(result.fileName() + " loading...");
+        int a = 213;
         result.future().thenAcceptAsync(res -> {
             if (!Objects.equals(res.fileName(), currentResult.fileName())) {
                 System.out.println("filenames not equal");
@@ -164,16 +135,14 @@ public class Viewer extends JFrame {
             this.setTitle(res.fileName());
             try {
                 SwingUtilities.invokeAndWait(imagePanel::repaint);
-            } catch (InterruptedException e) {
-                throw new RuntimeException(e);
-            } catch (InvocationTargetException e) {
+            } catch (InterruptedException | InvocationTargetException e) {
                 throw new RuntimeException(e);
             }
         });
     }
 
     private void loadNext() {
-        if (currentIdx >= dirHandler.getN() - 1)
+        if (currentIdx >= imageManager.getNumberOfImages() - 1)
             return;
         load(++currentIdx);
     }
@@ -182,17 +151,5 @@ public class Viewer extends JFrame {
         if (currentIdx <= 0)
             return;
         load(--currentIdx);
-    }
-
-    private void loadImage(File file) {
-
-        imgRef.set(imageCache.computeIfAbsent(file, f -> {
-            try {
-                return ImageIO.read(f);
-            } catch (IOException ignored) {
-            }
-            return null;
-        }));
-        SwingUtilities.invokeLater(imagePanel::repaint);
     }
 }

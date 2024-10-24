@@ -5,15 +5,19 @@ import org.imgscalr.Scalr;
 import javax.imageio.ImageIO;
 import java.awt.*;
 import java.awt.image.BufferedImage;
-import java.io.File;
 import java.io.IOException;
-import java.util.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Logger;
 
-public class ImageCache {
+public class ImageManager {
 
     private static final int STATUS_DONE = 2;
     private static final int STATUS_WAIT = 0;
@@ -23,15 +27,15 @@ public class ImageCache {
     private static final Logger LOG = Logger.getLogger("ImageCache");
     public final int threads;
 
-    private final DirHandler dir;
+    private final DirectoryHandler dir;
     private final Map<Integer, ImageProcessing> cache = new HashMap<>();
     private final LinkedBlockingDeque<Integer> workQueue = new LinkedBlockingDeque<>(10);
     private final ImageReaderThread[] readerThreads;
     private final Object updateLock = new Object();
     private final AtomicInteger lastRequest = new AtomicInteger(0);
 
-    public ImageCache(DirHandler dir, int fileCacheSize,int threads) {
-        this.dir = dir;
+    public ImageManager(Path directoryPath, int fileCacheSize, int threads) throws IOException {
+        this.dir = new DirectoryHandler(directoryPath);
         this.threads = threads;
         readerThreads = new ImageReaderThread[this.threads];
         for (int i = 0; i < threads; i++) {
@@ -43,7 +47,7 @@ public class ImageCache {
     }
 
     public ImageFutureHandle loadImage(int requestedFileIdx, int frameWidth, int frameHeight) {
-        String name = dir.getFile(requestedFileIdx).getName();
+        String name = dir.getFile(requestedFileIdx).getFileName().toString();
         Size size = new Size(frameWidth, frameHeight);
         lastRequest.set(requestedFileIdx);
         var scheduled = new HashSet<Integer>(15);
@@ -92,12 +96,12 @@ public class ImageCache {
     private boolean schedule(int idx, Size size) {
         if (idx < 0 || idx >= dir.getN())
             return false;
-        String name = dir.getFile(idx).getName();
+        String name = dir.getFile(idx).getFileName().toString();
         ImageProcessing imageProcessing = cache.get(idx);
         if (imageProcessing != null) {
             if (imageProcessing.fileName.equals(name) && imageProcessing.outputSize.equals(size))
                 return false;
-            System.out.println("wrong filename or frame size at idx " + idx + " | " + imageProcessing);
+            LOG.info("wrong filename or frame size at idx " + idx + " | " + imageProcessing.fileName);
         }
         cache.put(idx, new ImageProcessing(name, size));
         return true;
@@ -119,9 +123,35 @@ public class ImageCache {
         }
     }
 
-    public record ImageResult(int indexInDir, String fileName, BufferedImage image) {
+    public int getNumberOfImages() {
+        return dir.getN();
     }
 
+    private Size fitImageIntoFrame(Size img, Size frame) {
+        var sw = img.width;
+        var sh = img.height;
+
+        double sratio = (double) sw / sh;
+
+        var tw = frame.width;
+        var th = frame.height;
+
+        double tratio = (double) tw / th;
+
+        int rw, rh;
+        if (sratio > tratio) {
+            rw = tw;
+            rh = (int) (tw / sratio);
+        } else {
+            rh = th;
+            rw = (int) (th * sratio);
+        }
+
+        return new Size(rw, rh);
+    }
+
+    public record ImageResult(int indexInDir, String fileName, BufferedImage image) {
+    }
 
     public record ImageFutureHandle(int idx, String fileName, CompletableFuture<ImageResult> future) {
     }
@@ -146,6 +176,9 @@ public class ImageCache {
                     ", status=" + status +
                     '}';
         }
+    }
+
+    private record Size(int width, int height) {
     }
 
     private class ImageReaderThread implements Runnable {
@@ -190,9 +223,9 @@ public class ImageCache {
                         imageProcessing.status = STATUS_WORK;
                     }
                     long loadingStart = System.currentTimeMillis();
-                    File file = dir.getFile(idx);
-                    log.info("starting loading " + idx + " (" + file.getName() + ")");
-                    BufferedImage img = ImageIO.read(file);
+                    Path file = dir.getFile(idx);
+                    log.info("starting loading " + idx + " (" + file.getFileName().toString() + ")");
+                    BufferedImage img = ImageIO.read(Files.newInputStream(file));
                     Size targetImageSize = fitImageIntoFrame(new Size(img.getWidth(), img.getHeight()), imageProcessing.outputSize);
                     img = Scalr.scaleImageIncrementally(img, targetImageSize.width, targetImageSize.height, Scalr.Method.QUALITY, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
 
@@ -213,32 +246,6 @@ public class ImageCache {
 
             }
         }
-    }
-
-    private record Size (int width, int height) {
-    }
-
-    private Size fitImageIntoFrame(Size img, Size frame) {
-        var sw = img.width;
-        var sh = img.height;
-
-        double sratio = (double) sw / sh;
-
-        var tw = frame.width;
-        var th = frame.height;
-
-        double tratio = (double) tw / th;
-
-        int rw, rh;
-        if (sratio > tratio) {
-            rw = tw;
-            rh = (int) (tw / sratio);
-        } else {
-            rh = th;
-            rw = (int) (th * sratio);
-        }
-
-        return new Size(rw, rh);
     }
 
     private class CleanerThread implements Runnable {
