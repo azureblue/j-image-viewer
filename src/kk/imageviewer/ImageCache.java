@@ -7,11 +7,7 @@ import java.awt.*;
 import java.awt.image.BufferedImage;
 import java.io.File;
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.Map;
-import java.util.concurrent.BlockingDeque;
+import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -23,59 +19,70 @@ public class ImageCache {
     private static final int STATUS_WAIT = 0;
     private static final int STATUS_WORK = 1;
 
+
     private static final Logger LOG = Logger.getLogger("ImageCache");
-    public static final int NUMBER_OF_THREADS = 4;
+    public final int threads;
 
     private final DirHandler dir;
     private final Map<Integer, ImageProcessing> cache = new HashMap<>();
-    private final BlockingDeque<Integer> workQueue = new LinkedBlockingDeque<>(10);
-    private final ImageReaderThread[] threads = new ImageReaderThread[NUMBER_OF_THREADS];
+    private final LinkedBlockingDeque<Integer> workQueue = new LinkedBlockingDeque<>(10);
+    private final ImageReaderThread[] readerThreads;
     private final Object updateLock = new Object();
     private final AtomicInteger lastRequest = new AtomicInteger(0);
 
-    public ImageCache(DirHandler dir, int fileCacheSize, int th) {
+    public ImageCache(DirHandler dir, int fileCacheSize,int threads) {
         this.dir = dir;
-        for (int i = 0; i < 4; i++) {
-            threads[i] = new ImageReaderThread(i);
-            new Thread(threads[i]).start();
+        this.threads = threads;
+        readerThreads = new ImageReaderThread[this.threads];
+        for (int i = 0; i < threads; i++) {
+            readerThreads[i] = new ImageReaderThread(i);
+            new Thread(readerThreads[i]).start();
         }
 
         new Thread(new CleanerThread()).start();
     }
 
-    public ImageFutureHandle loadImage(int idx, int frameWidth, int frameHeight) {
-        String name = dir.getFile(idx).getName();
+    public ImageFutureHandle loadImage(int requestedFileIdx, int frameWidth, int frameHeight) {
+        String name = dir.getFile(requestedFileIdx).getName();
         Size size = new Size(frameWidth, frameHeight);
-        lastRequest.set(idx);
-        ArrayList<Integer> scheduled = new ArrayList<>(15);
+        lastRequest.set(requestedFileIdx);
+        var scheduled = new HashSet<Integer>(15);
         ImageFutureHandle res;
         synchronized (updateLock) {
-            for (int i = idx - 5; i <= idx + 5; i++) {
+            for (int i = requestedFileIdx - 5; i <= requestedFileIdx + 5; i++) {
                 if (schedule(i, size))
                     scheduled.add(i);
             }
-            ImageProcessing imageProcessing = cache.get(idx);
+            ImageProcessing imageProcessing = cache.get(requestedFileIdx);
             if (imageProcessing != null) {
                 if (imageProcessing.status == STATUS_DONE) {
-                    res = new ImageFutureHandle(idx, name,
-                            CompletableFuture.completedFuture(new ImageResult(idx, imageProcessing.fileName, imageProcessing.img)));
+                    res = new ImageFutureHandle(requestedFileIdx, name,
+                            CompletableFuture.completedFuture(new ImageResult(requestedFileIdx, imageProcessing.fileName, imageProcessing.img)));
                 } else {
                     CompletableFuture<ImageResult> future = new CompletableFuture<>();
                     if (imageProcessing.future != null)
                         imageProcessing.future.cancel(true);
                     imageProcessing.future = future;
 
-                    res = new ImageFutureHandle(idx, name, future);
+                    res = new ImageFutureHandle(requestedFileIdx, name, future);
                 }
             } else {
                 throw new IllegalStateException("no mapping in cache");
             }
         }
-        for (Integer i : scheduled) {
+        boolean requestedIdxScheduled = scheduled.remove(requestedFileIdx);
+        if (requestedIdxScheduled) {
             try {
-                workQueue.putFirst(i);
+                workQueue.putFirst(requestedFileIdx);
             } catch (InterruptedException e) {
-                throw new RuntimeException(e);
+                res.future.cancel(true);
+                return res;
+            }
+        }
+        for (Integer idx : scheduled) {
+            try {
+                workQueue.putLast(idx);
+            } catch (InterruptedException ignored) {
             }
         }
 

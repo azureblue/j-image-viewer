@@ -4,10 +4,7 @@ package kk.imageviewer;
 import javax.imageio.ImageIO;
 import javax.swing.*;
 import java.awt.*;
-import java.awt.event.ComponentAdapter;
-import java.awt.event.ComponentEvent;
-import java.awt.event.KeyAdapter;
-import java.awt.event.KeyEvent;
+import java.awt.event.*;
 import java.awt.image.BufferedImage;
 import java.io.File;
 import java.io.FileInputStream;
@@ -27,7 +24,6 @@ public class Viewer extends JFrame {
     private final Map<File, BufferedImage> imageCache = new HashMap<>();
     private final Map<File, BufferedImage> renderedCache = new HashMap<>();
     AtomicReference<BufferedImage> imgRef = new AtomicReference<>();
-    AtomicReference<Integer> lastImageIdx = new AtomicReference<>(-1);
     private final JPanel imagePanel = new JPanel(true) {
         {
             setBackground(Color.BLACK);
@@ -59,6 +55,7 @@ public class Viewer extends JFrame {
         protected void paintChildren(Graphics g) {
         }
     };
+    AtomicReference<Integer> lastImageIdx = new AtomicReference<>(-1);
     private int currentIdx = 0;
     private ImageCache.ImageFutureHandle currentResult;
 
@@ -71,22 +68,64 @@ public class Viewer extends JFrame {
         this.dirHandler = new DirHandler(new File(dirPath));
         this.cache = new ImageCache(dirHandler, 0, 4);
         this.currentIdx = 0;
+        setupListeners();
+    }
+
+    public static void main(String[] args) throws UnsupportedLookAndFeelException, ClassNotFoundException, InstantiationException, IllegalAccessException, IOException {
+        LogManager.getLogManager().readConfiguration(new FileInputStream("logging.properties"));
+        UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
+        new Viewer("/media/sshfs0/photo/").setVisible(true);
+    }
+
+    private boolean isCurrentLoadingInProgress() {
+        return currentResult != null && !currentResult.future().isDone();
+    }
+
+    private void setupListeners() {
+        this.addWindowListener(new WindowAdapter() {
+            @Override
+            public void windowOpened(WindowEvent e) {
+                super.windowOpened(e);
+                load(currentIdx);
+            }
+        });
+
+        this.addComponentListener(new ComponentAdapter() {
+            private Timer recalculateTimer = new Timer(150, (ignored) -> reload());
+
+            {
+                recalculateTimer.setRepeats(false);
+            }
+
+            @Override
+            public void componentResized(ComponentEvent e) {
+                recalculateTimer.restart();
+                recalculateTimer.start();
+            }
+        });
+
+        this.addMouseWheelListener(new MouseAdapter() {
+            @Override
+            public void mouseWheelMoved(MouseWheelEvent e) {
+                if (isCurrentLoadingInProgress())
+                    return;
+                if (e.getWheelRotation() > 0)
+                    loadNext();
+                else if (e.getWheelRotation() < 0)
+                    loadPrev();
+            }
+        });
+
         this.addKeyListener(new KeyAdapter() {
             @Override
             public void keyPressed(KeyEvent e) {
+                if (isCurrentLoadingInProgress())
+                    return;
                 if (e.getKeyCode() == KeyEvent.VK_DOWN) {
-                    if (currentResult != null && !currentResult.future().isDone())
-                        return;
                     loadNext();
-                }
-                else if (e.getKeyCode() == KeyEvent.VK_UP) {
-                    if (currentResult != null && !currentResult.future().isDone())
-                        return;
+                } else if (e.getKeyCode() == KeyEvent.VK_UP) {
                     loadPrev();
-                }
-                else if (e.getKeyCode() == KeyEvent.VK_DELETE) {
-                    if (currentResult != null && !currentResult.future().isDone())
-                        return;
+                } else if (e.getKeyCode() == KeyEvent.VK_DELETE) {
                     if (e.isShiftDown()) {
                         if (System.currentTimeMillis() - e.getWhen() < 100) {
                             if (currentIdx != lastImageIdx.get()) {
@@ -100,22 +139,19 @@ public class Viewer extends JFrame {
                     }
                 }
             }
+
+
         });
-        load(currentIdx);
     }
 
-
-
-    public static void main(String[] args) throws UnsupportedLookAndFeelException, ClassNotFoundException, InstantiationException, IllegalAccessException, IOException {
-        LogManager.getLogManager().readConfiguration(new FileInputStream("logging.properties"));
-        UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
-        new Viewer("/media/sshfs0/photo/").setVisible(true);
+    private void reload() {
+        load(currentIdx);
     }
 
     private void load(int idx) {
         if (this.currentResult != null)
             currentResult.future().cancel(false);
-        ImageCache.ImageFutureHandle result = cache.loadImage(idx, 1000, 800);
+        ImageCache.ImageFutureHandle result = cache.loadImage(idx, imagePanel.getWidth(), imagePanel.getHeight());
         currentResult = result;
         this.setTitle(result.fileName() + " loading...");
         result.future().thenAcceptAsync(res -> {
@@ -142,7 +178,7 @@ public class Viewer extends JFrame {
         load(++currentIdx);
     }
 
-    private void loadPrev(){
+    private void loadPrev() {
         if (currentIdx <= 0)
             return;
         load(--currentIdx);
