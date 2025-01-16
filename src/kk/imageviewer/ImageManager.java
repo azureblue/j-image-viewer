@@ -224,11 +224,13 @@ public class ImageManager {
                     }
                     long loadingStart = System.currentTimeMillis();
                     Path file = dir.getFile(idx);
-                    log.info("starting loading " + idx + " (" + file.getFileName().toString() + ")");
+                    log.info("loading start " + idx + " (" + file.getFileName().toString() + ")");
                     BufferedImage img = ImageIO.read(Files.newInputStream(file));
+                    log.info("loading done " + idx + " (" + file.getFileName().toString() + ")" + " in " + (System.currentTimeMillis() - loadingStart) + "ms");
+                    loadingStart = System.currentTimeMillis();
                     Size targetImageSize = fitImageIntoFrame(new Size(img.getWidth(), img.getHeight()), imageProcessing.outputSize);
                     img = Scalr.scaleImageIncrementally(img, targetImageSize.width, targetImageSize.height, Scalr.Method.QUALITY, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
-
+                    log.info("scaling done " + idx + " (" + file.getFileName().toString() + ")" + " in " + (System.currentTimeMillis() - loadingStart) + "ms");
                     synchronized (updateLock) {
                         imageProcessing.status = STATUS_DONE;
                         imageProcessing.img = img;
@@ -237,8 +239,6 @@ public class ImageManager {
                             future.complete(new ImageResult(idx, imageProcessing.fileName, img));
                         }
                         imageProcessing.future = null;
-
-                        log.info("loading done " + idx + " in " + (System.currentTimeMillis() - loadingStart) + "ms");
                     }
                 } catch (IOException | InterruptedException e) {
                     e.printStackTrace();
