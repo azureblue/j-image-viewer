@@ -222,15 +222,15 @@ public class ImageManager {
                         }
                         imageProcessing.status = STATUS_WORK;
                     }
-                    long loadingStart = System.currentTimeMillis();
+                    long time = System.currentTimeMillis();
                     Path file = dir.getFile(idx);
                     log.info("loading start " + idx + " (" + file.getFileName().toString() + ")");
                     BufferedImage img = ImageIO.read(Files.newInputStream(file));
-                    log.info("loading done " + idx + " (" + file.getFileName().toString() + ")" + " in " + (System.currentTimeMillis() - loadingStart) + "ms");
-                    loadingStart = System.currentTimeMillis();
+                    log.info("loading done " + idx + " (" + file.getFileName().toString() + ")" + " in " + (System.currentTimeMillis() - time) + "ms");
+                    time = System.currentTimeMillis();
                     Size targetImageSize = fitImageIntoFrame(new Size(img.getWidth(), img.getHeight()), imageProcessing.outputSize);
                     img = Scalr.scaleImageIncrementally(img, targetImageSize.width, targetImageSize.height, Scalr.Method.QUALITY, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
-                    log.info("scaling done " + idx + " (" + file.getFileName().toString() + ")" + " in " + (System.currentTimeMillis() - loadingStart) + "ms");
+                    log.info("scaling done " + idx + " (" + file.getFileName().toString() + ")" + " in " + (System.currentTimeMillis() - time) + "ms");
                     synchronized (updateLock) {
                         imageProcessing.status = STATUS_DONE;
                         imageProcessing.img = img;
